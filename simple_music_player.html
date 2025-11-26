@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIFF Audio Player (Engine V3)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #e2e8f0;
+        }
+
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+        }
+
+        input[type=range] {
+            -webkit-appearance: none; 
+            background: transparent; 
+        }
+        
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 16px;
+            width: 16px;
+            border-radius: 50%;
+            background: #38bdf8;
+            cursor: pointer;
+            margin-top: -6px; 
+            box-shadow: 0 0 10px rgba(56, 189, 248, 0.5);
+        }
+
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: #334155;
+            border-radius: 2px;
+        }
+
+        input[type=range]:focus::-webkit-slider-runnable-track {
+            background: #475569;
+        }
+
+        #visualizer {
+            width: 100%;
+            height: 120px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .btn-hover:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(56, 189, 248, 0.25);
+        }
+        .btn-active:active {
+            transform: translateY(0px);
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col items-center justify-center p-4 overflow-hidden">
+
+    <!-- Main Container -->
+    <div class="glass-panel w-full max-w-md rounded-2xl overflow-hidden flex flex-col relative">
+        
+        <!-- Header -->
+        <div class="p-6 bg-slate-800/50 border-b border-white/5 flex justify-between items-center">
+            <div class="flex items-center gap-3">
+                <div class="w-8 h-8 bg-sky-500 rounded-lg flex items-center justify-center shadow-lg shadow-sky-500/20">
+                    <i class="fa-solid fa-music text-white text-sm"></i>
+                </div>
+                <h1 class="text-lg font-semibold tracking-tight text-white">AIFF Player</h1>
+            </div>
+            <span class="text-xs px-2 py-1 bg-slate-700 rounded text-slate-400 border border-slate-600">.AIFF</span>
+        </div>
+
+        <!-- Visualizer Canvas -->
+        <canvas id="visualizer" width="800" height="240"></canvas>
+
+        <!-- File Info & Status -->
+        <div class="px-6 pt-6 pb-2 text-center">
+            <h2 id="track-name" class="text-xl font-semibold text-white truncate mb-1">No File Selected</h2>
+            <p id="status-text" class="text-sm text-slate-400">Please upload an audio file to begin</p>
+        </div>
+
+        <!-- Controls Area -->
+        <div class="p-6 space-y-6">
+            
+            <!-- Time Progress -->
+            <div class="space-y-2">
+                <input type="range" id="seek-slider" class="w-full" min="0" max="100" value="0" disabled>
+                <div class="flex justify-between text-xs text-slate-500 font-mono">
+                    <span id="current-time">0:00</span>
+                    <span id="duration">0:00</span>
+                </div>
+            </div>
+
+            <!-- Playback Controls -->
+            <div class="flex justify-center items-center gap-6">
+                <button id="btn-backward" class="text-slate-400 hover:text-white transition-colors p-2" disabled>
+                    <i class="fa-solid fa-backward text-xl"></i>
+                </button>
+                
+                <button id="btn-play" class="w-16 h-16 rounded-full bg-sky-500 text-white flex items-center justify-center text-2xl btn-hover btn-active transition-all shadow-xl shadow-sky-900/20" disabled>
+                    <i class="fa-solid fa-play pl-1"></i>
+                </button>
+
+                <button id="btn-forward" class="text-slate-400 hover:text-white transition-colors p-2" disabled>
+                    <i class="fa-solid fa-forward text-xl"></i>
+                </button>
+            </div>
+
+            <!-- Volume & Upload -->
+            <div class="flex justify-between items-center pt-4 border-t border-white/5">
+                <div class="flex items-center gap-3 w-1/2 group">
+                    <button id="mute-btn" class="text-slate-400 group-hover:text-sky-400 transition-colors">
+                        <i class="fa-solid fa-volume-high"></i>
+                    </button>
+                    <input type="range" id="volume-slider" class="w-24 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer" min="0" max="1" step="0.01" value="1">
+                </div>
+
+                <div class="relative">
+                    <input type="file" id="audio-upload" accept=".aif,.aiff,.wav" class="hidden">
+                    <label for="audio-upload" class="cursor-pointer flex items-center gap-2 px-4 py-2 rounded-full bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm font-medium transition-colors border border-white/5">
+                        <i class="fa-solid fa-upload"></i> Upload
+                    </label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        /**
+         * AIFF Player V3
+         * - Removed <audio> element entirely
+         * - Added automatic pad-byte handling for IFF chunks
+         * - Robust error catching for both Native and Manual decoders
+         */
+        
+        // DOM Elements
+        const upload = document.getElementById('audio-upload');
+        const playBtn = document.getElementById('btn-play');
+        const backBtn = document.getElementById('btn-backward');
+        const fwdBtn = document.getElementById('btn-forward');
+        const seekSlider = document.getElementById('seek-slider');
+        const volumeSlider = document.getElementById('volume-slider');
+        const currentTimeEl = document.getElementById('current-time');
+        const durationEl = document.getElementById('duration');
+        const trackNameEl = document.getElementById('track-name');
+        const statusTextEl = document.getElementById('status-text');
+        const muteBtn = document.getElementById('mute-btn');
+        const canvas = document.getElementById('visualizer');
+        const canvasCtx = canvas.getContext('2d');
+
+        // Audio State
+        let audioCtx = null;
+        let audioBuffer = null;
+        let sourceNode = null;
+        let gainNode = null;
+        let analyser = null;
+        let isPlaying = false;
+        let startTime = 0; 
+        let pausedAt = 0;  
+        let animationId;
+        let previousVolume = 1;
+
+        // Initialize Context
+        function initAudioContext() {
+            if (!audioCtx) {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                audioCtx = new AudioContext();
+                gainNode = audioCtx.createGain();
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 256;
+                analyser.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+                drawVisualizer();
+            } else if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        // Handle File Upload
+        upload.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            initAudioContext();
+            stopAudio();
+            
+            trackNameEl.textContent = file.name;
+            statusTextEl.textContent = "Decoding data...";
+            statusTextEl.className = "text-sm text-yellow-400 animate-pulse";
+            
+            playBtn.disabled = true;
+            seekSlider.disabled = true;
+
+            const reader = new FileReader();
+            reader.onload = function(eve) {
+                const arrayBuffer = eve.target.result;
+
+                // 1. Try Native Browser Decode
+                audioCtx.decodeAudioData(arrayBuffer.slice(0)) 
+                    .then(onDecodeSuccess)
+                    .catch((err) => {
+                        console.warn("Native decode failed (" + err.message + "), attempting manual AIFF parse...");
+                        statusTextEl.textContent = "Native decode failed, trying manual...";
+                        
+                        // 2. Fallback: Manual Parsing
+                        try {
+                            const manualBuffer = parseAIFFManually(arrayBuffer, audioCtx);
+                            onDecodeSuccess(manualBuffer);
+                        } catch (manualErr) {
+                            console.error("Manual decode failed:", manualErr);
+                            statusTextEl.textContent = "Error: File corrupted or unsupported.";
+                            statusTextEl.className = "text-sm text-red-400";
+                        }
+                    });
+            };
+            reader.onerror = () => {
+                statusTextEl.textContent = "Error reading file.";
+                statusTextEl.className = "text-sm text-red-400";
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        function onDecodeSuccess(decodedBuffer) {
+            audioBuffer = decodedBuffer;
+            durationEl.textContent = formatTime(audioBuffer.duration);
+            statusTextEl.textContent = "Ready to play";
+            statusTextEl.className = "text-sm text-slate-400";
+            
+            playBtn.disabled = false;
+            backBtn.disabled = false;
+            fwdBtn.disabled = false;
+            seekSlider.disabled = false;
+            seekSlider.value = 0;
+            pausedAt = 0;
+            currentTimeEl.textContent = "0:00";
+        }
+
+        /**
+         * MANUAL AIFF PARSER V2
+         * Includes fixes for Pad Bytes (odd-sized chunks)
+         */
+        function parseAIFFManually(arrayBuffer, context) {
+            const view = new DataView(arrayBuffer);
+            let offset = 0;
+
+            function getString(len) {
+                let str = '';
+                for (let i = 0; i < len; i++) {
+                    if (offset + i < view.byteLength) {
+                        str += String.fromCharCode(view.getUint8(offset + i));
+                    }
+                }
+                return str;
+            }
+
+            const chunkId = getString(4); offset += 4;
+            const chunkSize = view.getUint32(offset, false); offset += 4; 
+            const format = getString(4); offset += 4;
+
+            if (chunkId !== 'FORM' || (format !== 'AIFF' && format !== 'AIFC')) {
+                throw new Error("Not a valid AIFF file");
+            }
+
+            let channels = 0, numFrames = 0, bitDepth = 16, sampleRate = 44100;
+            let audioOffset = 0;
+
+            while (offset < view.byteLength) {
+                const id = getString(4); offset += 4;
+                const size = view.getUint32(offset, false); offset += 4;
+
+                const nextChunkOffset = offset + size + (size % 2); // Handle Pad Byte
+
+                if (id === 'COMM') {
+                    channels = view.getInt16(offset, false);
+                    numFrames = view.getUint32(offset + 2, false);
+                    bitDepth = view.getInt16(offset + 6, false);
+                    
+                    // Parse 80-bit float sample rate
+                    const exp = view.getUint16(offset + 8, false);
+                    const manHigh = view.getUint32(offset + 10, false);
+                    const manLow = view.getUint32(offset + 14, false);
+                    const mantissa = manHigh * 4294967296 + manLow;
+                    sampleRate = mantissa * Math.pow(2, exp - 16383 - 63);
+                } 
+                else if (id === 'SSND') {
+                    const offsetBytes = view.getUint32(offset, false);
+                    // The sound data starts after offsetBytes + 8 bytes of SSND header
+                    audioOffset = offset + 8 + offsetBytes;
+                }
+                
+                offset = nextChunkOffset;
+            }
+
+            if (!audioOffset || !channels) throw new Error("Invalid chunk structure: No SSND found");
+
+            // Safety check for sample rate
+            if (!isFinite(sampleRate) || sampleRate < 3000 || sampleRate > 384000) {
+                console.warn("Invalid sample rate detected: " + sampleRate + ". Defaulting to 44100.");
+                sampleRate = 44100;
+            }
+
+            const buffer = context.createBuffer(channels, numFrames, sampleRate);
+
+            // Convert PCM Data
+            const channelData = [];
+            for (let c = 0; c < channels; c++) {
+                channelData[c] = buffer.getChannelData(c);
+            }
+
+            let frameIndex = 0;
+            let byteIndex = audioOffset;
+            const bytesPerSample = bitDepth / 8;
+
+            if (bitDepth !== 16 && bitDepth !== 24) {
+                throw new Error("Only 16-bit and 24-bit AIFF supported manually");
+            }
+
+            while (frameIndex < numFrames && byteIndex < view.byteLength) {
+                for (let c = 0; c < channels; c++) {
+                    let sample = 0;
+                    
+                    if (byteIndex + bytesPerSample > view.byteLength) break;
+
+                    if (bitDepth === 16) {
+                        sample = view.getInt16(byteIndex, false); 
+                        sample = sample / 32768; 
+                    } else if (bitDepth === 24) {
+                        const b1 = view.getUint8(byteIndex);
+                        const b2 = view.getUint8(byteIndex + 1);
+                        const b3 = view.getUint8(byteIndex + 2);
+                        let val = (b1 << 16) | (b2 << 8) | b3;
+                        if (val & 0x800000) val -= 16777216; 
+                        sample = val / 8388608;
+                    }
+                    
+                    if (frameIndex < numFrames) {
+                        channelData[c][frameIndex] = sample;
+                    }
+                    byteIndex += bytesPerSample;
+                }
+                frameIndex++;
+            }
+
+            return buffer;
+        }
+
+
+        // Playback Logic
+        playBtn.addEventListener('click', () => {
+            if (!audioBuffer) return;
+            if (isPlaying) pauseAudio();
+            else playAudio();
+        });
+
+        function playAudio() {
+            // Check if pausedAt is valid
+            if (pausedAt >= audioBuffer.duration) pausedAt = 0;
+
+            sourceNode = audioCtx.createBufferSource();
+            sourceNode.buffer = audioBuffer;
+            sourceNode.connect(analyser);
+            sourceNode.start(0, pausedAt);
+            startTime = audioCtx.currentTime - pausedAt;
+            
+            isPlaying = true;
+            playBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
+            statusTextEl.textContent = "Playing";
+            statusTextEl.className = "text-sm text-sky-400";
+
+            updateProgress();
+
+            sourceNode.onended = function() {
+                // Only stop if naturally ended
+                if (isPlaying && Math.abs(audioCtx.currentTime - startTime - audioBuffer.duration) < 0.5) {
+                    stopAudio();
+                    statusTextEl.textContent = "Ended";
+                }
+            };
+        }
+
+        function pauseAudio() {
+            if (sourceNode) {
+                try { sourceNode.stop(); } catch(e) {}
+                sourceNode = null;
+            }
+            pausedAt = audioCtx.currentTime - startTime;
+            isPlaying = false;
+            playBtn.innerHTML = '<i class="fa-solid fa-play pl-1"></i>';
+            statusTextEl.textContent = "Paused";
+            statusTextEl.className = "text-sm text-slate-400";
+            cancelAnimationFrame(animationId);
+        }
+
+        function stopAudio() {
+            if (sourceNode) {
+                try { sourceNode.stop(); } catch(e) {}
+                sourceNode = null;
+            }
+            isPlaying = false;
+            pausedAt = 0;
+            playBtn.innerHTML = '<i class="fa-solid fa-play pl-1"></i>';
+            seekSlider.value = 0;
+            currentTimeEl.textContent = "0:00";
+            cancelAnimationFrame(animationId);
+        }
+
+        seekSlider.addEventListener('input', (e) => {
+            if (!audioBuffer) return;
+            const percent = e.target.value;
+            const newTime = (percent / 100) * audioBuffer.duration;
+            pausedAt = newTime;
+            currentTimeEl.textContent = formatTime(newTime);
+
+            if (isPlaying) {
+                if (sourceNode) try { sourceNode.stop(); } catch(e) {}
+                playAudio(); // Restart immediately at new time
+            }
+        });
+
+        backBtn.addEventListener('click', () => {
+            if (!audioBuffer) return;
+            pausedAt = Math.max(0, pausedAt - 10);
+            updateSeekAfterJump();
+        });
+
+        fwdBtn.addEventListener('click', () => {
+            if (!audioBuffer) return;
+            pausedAt = Math.min(audioBuffer.duration, pausedAt + 10);
+            updateSeekAfterJump();
+        });
+
+        function updateSeekAfterJump() {
+            if(isPlaying) {
+                if (sourceNode) try { sourceNode.stop(); } catch(e) {}
+                playAudio();
+            } else {
+                seekSlider.value = (pausedAt / audioBuffer.duration) * 100;
+                currentTimeEl.textContent = formatTime(pausedAt);
+            }
+        }
+
+        function updateProgress() {
+            if (!isPlaying) return;
+            const current = audioCtx.currentTime - startTime;
+            pausedAt = current;
+            
+            if (current > audioBuffer.duration) return;
+
+            const percent = (current / audioBuffer.duration) * 100;
+            seekSlider.value = percent;
+            currentTimeEl.textContent = formatTime(current);
+            animationId = requestAnimationFrame(updateProgress);
+        }
+
+        // Volume
+        volumeSlider.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            if(gainNode) gainNode.gain.value = val;
+            updateVolumeIcon(val);
+        });
+
+        muteBtn.addEventListener('click', () => {
+            if (!gainNode) return;
+            if (gainNode.gain.value > 0) {
+                previousVolume = volumeSlider.value;
+                gainNode.gain.value = 0;
+                volumeSlider.value = 0;
+            } else {
+                gainNode.gain.value = previousVolume;
+                volumeSlider.value = previousVolume;
+            }
+            updateVolumeIcon(gainNode.gain.value);
+        });
+
+        function updateVolumeIcon(vol) {
+            const icon = muteBtn.querySelector('i');
+            icon.className = '';
+            if (vol === 0) icon.classList.add('fa-solid', 'fa-volume-mute');
+            else if (vol < 0.5) icon.classList.add('fa-solid', 'fa-volume-low');
+            else icon.classList.add('fa-solid', 'fa-volume-high');
+        }
+
+        function formatTime(seconds) {
+            if (isNaN(seconds)) return "0:00";
+            const minutes = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${minutes}:${secs < 10 ? '0' : ''}${secs}`;
+        }
+
+        // Visualizer
+        function drawVisualizer() {
+            requestAnimationFrame(drawVisualizer);
+            if(!analyser) return;
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteFrequencyData(dataArray);
+
+            canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            const barWidth = (canvas.width / bufferLength) * 2.5;
+            let x = 0;
+
+            for(let i = 0; i < bufferLength; i++) {
+                const barHeight = dataArray[i];
+                const r = 56 + (barHeight/255) * 100; 
+                const g = 189 + (barHeight/255) * 50;
+                const b = 248; 
+
+                canvasCtx.fillStyle = `rgb(${r},${g},${b})`;
+                const scaledHeight = (barHeight / 255) * canvas.height;
+                
+                if (scaledHeight > 0) {
+                    canvasCtx.fillRect(x, canvas.height - scaledHeight, barWidth - 1, scaledHeight);
+                }
+                x += barWidth + 1;
+            }
+        }
+    </script>
+</body>
+</html>
