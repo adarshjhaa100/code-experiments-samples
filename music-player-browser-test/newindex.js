@@ -1,9 +1,157 @@
 // CONFIGURATION
 const BUFFER_THRESHOLD = 1024 * 1024; // 1 MB Buffer
-const INITIAL_THRESHOLD = 256 * 1024; // 256 KB Start
 
 /**
- * 🎨 VISUALIZER (Standard)
+ * 🛠 AIFF PARSER (The Core Engine)
+ * Parses raw bytes, extracts metadata, and converts Big-Endian PCM to Float32.
+ */
+class AiffParser {
+    constructor() {
+        this.headerParsed = false;
+        this.numChannels = 2;
+        this.sampleRate = 44100;
+        this.bitDepth = 16;
+        this.dataOffset = 0; // Where SSND data starts
+        this.dataSize = 0;
+        this.frameSize = 4; // channels * bytesPerSample
+    }
+
+    // Helper: Convert AIFF 80-bit Extended Float to Javascript Double
+    parseExtended(view, offset) {
+        const exponent = view.getUint16(offset, false);
+        let mantissaHigh = view.getUint32(offset + 2, false);
+        let mantissaLow = view.getUint32(offset + 6, false);
+        
+        const sign = (exponent & 0x8000) ? -1 : 1;
+        const exp = (exponent & 0x7FFF) - 16383;
+        
+        let mantissa = mantissaHigh * Math.pow(2, -32) + mantissaLow * Math.pow(2, -64);
+        
+        if (exp === -16383) return 0; // Denormalized or zero
+        
+        // 80-bit float has an explicit integer bit (unlike 64-bit IEEE)
+        // If the integer bit is set (normal number), we normalize.
+        // Usually AIFF 80-bit floats are normalized.
+        
+        return sign * mantissa * Math.pow(2, exp);
+    }
+
+    parseHeader(view) {
+        if (this.headerParsed) return true;
+        
+        // Check "FORM"
+        const formId = this.getAscii(view, 0, 4);
+        if (formId !== 'FORM') return false; // Not enough data or invalid
+        
+        // Check "AIFF"
+        const typeId = this.getAscii(view, 8, 4);
+        if (typeId !== 'AIFF') return false;
+
+        let offset = 12;
+        let foundComm = false;
+        let foundSsnd = false;
+
+        // Scan chunks
+        while (offset < view.byteLength) {
+            if (offset + 8 > view.byteLength) break; // Incomplete chunk header
+
+            const chunkId = this.getAscii(view, offset, 4);
+            const chunkSize = view.getUint32(offset + 4, false); // Big Endian size
+
+            if (chunkId === 'COMM') {
+                if (offset + 26 > view.byteLength) break; // Need enough bytes for COMM
+                
+                this.numChannels = view.getInt16(offset + 8, false);
+                // numSampleFrames (4 bytes) at offset+10
+                this.bitDepth = view.getInt16(offset + 14, false);
+                // sampleRate (10 bytes) at offset+16
+                this.sampleRate = this.parseExtended(view, offset + 16);
+                
+                foundComm = true;
+                // console.log(`AIFF Metadata: ${this.numChannels}ch, ${this.sampleRate}Hz, ${this.bitDepth}bit`);
+            }
+            else if (chunkId === 'SSND') {
+                // SSND chunk data starts at offset + 8 (header) + 8 (offset/blockSize)
+                // The actual audio data starts after the chunk header + 8 bytes of SSND parameters
+                this.dataOffset = offset + 8 + 8; 
+                this.dataSize = chunkSize - 8;
+                foundSsnd = true;
+            }
+
+            offset += 8 + chunkSize;
+            // Pad byte if size is odd
+            if (chunkSize % 2 !== 0) offset++;
+            
+            if (foundComm && foundSsnd) {
+                this.headerParsed = true;
+                this.frameSize = this.numChannels * (this.bitDepth / 8);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Convert raw Big-Endian bytes to Float32 Planes (WebAudio format)
+    decode(rawBytes) {
+        // rawBytes is a Uint8Array containing ONLY the audio data part
+        const view = new DataView(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
+        const numSamples = Math.floor(rawBytes.byteLength / (this.bitDepth / 8));
+        const numFrames = Math.floor(numSamples / this.numChannels);
+
+        // Prepare output planes (Planar format: LLL... RRR...)
+        const planes = [];
+        for (let ch = 0; ch < this.numChannels; ch++) {
+            planes.push(new Float32Array(numFrames));
+        }
+
+        let bytePtr = 0;
+        const is16Bit = this.bitDepth === 16;
+        const is24Bit = this.bitDepth === 24;
+
+        for (let i = 0; i < numFrames; i++) {
+            for (let ch = 0; ch < this.numChannels; ch++) {
+                let sample = 0;
+                
+                if (is16Bit) {
+                    // Big Endian 16-bit
+                    sample = view.getInt16(bytePtr, false);
+                    sample = sample / 32768.0; // Normalize to -1.0 -> 1.0
+                    bytePtr += 2;
+                } else if (is24Bit) {
+                    // Big Endian 24-bit
+                    const b1 = view.getUint8(bytePtr);
+                    const b2 = view.getUint8(bytePtr + 1);
+                    const b3 = view.getUint8(bytePtr + 2);
+                    // Combine to 24-bit signed
+                    let s32 = (b1 << 24) | (b2 << 16) | (b3 << 8);
+                    s32 = s32 >> 8; // Sign extend
+                    sample = s32 / 8388608.0;
+                    bytePtr += 3;
+                } else {
+                    // 8-bit (Usually signed in AIFF)
+                    sample = view.getInt8(bytePtr);
+                    sample = sample / 128.0;
+                    bytePtr += 1;
+                }
+
+                planes[ch][i] = sample;
+            }
+        }
+        return planes;
+    }
+
+    getAscii(view, offset, len) {
+        let str = "";
+        for (let i = 0; i < len; i++) {
+            const charCode = view.getUint8(offset + i);
+            if (charCode > 31 && charCode < 127) str += String.fromCharCode(charCode);
+        }
+        return str;
+    }
+}
+
+/**
+ * 🎨 VISUALIZER
  */
 class Visualizer {
     constructor(canvasId, onSeek) {
@@ -105,50 +253,7 @@ class Visualizer {
 }
 
 /**
- * 🛠 PATCHERS
- */
-class AiffHeaderPatcher {
-    static patch(view, totalLength) {
-        view.setUint32(4, totalLength - 8, false);
-        let offset = 12; 
-        while (offset < view.byteLength - 8) {
-            const chunkId = this.getAscii(view, offset, 4);
-            const chunkSize = view.getUint32(offset + 4, false);
-            if (chunkId === "SSND") {
-                view.setUint32(offset + 4, totalLength - (offset + 8), false); break;
-            }
-            offset += 8 + chunkSize;
-        }
-    }
-    static getAscii(view, offset, len) {
-        let str = "";
-        for (let i = 0; i < len; i++) str += String.fromCharCode(view.getUint8(offset + i));
-        return str;
-    }
-}
-
-class WavHeaderPatcher {
-    static patch(view, totalLength) {
-        view.setUint32(4, totalLength - 8, true);
-        let offset = 12;
-        while (offset < view.byteLength - 8) {
-            const chunkId = this.getAscii(view, offset, 4);
-            if (chunkId === "data") {
-                view.setUint32(offset + 4, totalLength - (offset + 8), true); break;
-            }
-            const chunkSize = view.getUint32(offset + 4, true);
-            offset += 8 + chunkSize;
-        }
-    }
-    static getAscii(view, offset, len) {
-        let str = "";
-        for (let i = 0; i < len; i++) str += String.fromCharCode(view.getUint8(offset + i));
-        return str;
-    }
-}
-
-/**
- * 🔈 BASE PLAYER (With Heartbeat Monitor)
+ * 🔈 BASE PLAYER
  */
 class BasePlayer {
     constructor() {
@@ -158,18 +263,10 @@ class BasePlayer {
         this.abortController = null;
         this.fullAudioBuffer = null;
         this.visualizer = null;
-        
-        // Logic State
         this.isStopped = true;
         this.isDownloading = false;
         this.startTime = 0;
         this.playedOffset = 0;
-        
-        // Duration Logic
-        this.totalFileBytes = 0;
-        this.estimatedDuration = 0;
-        
-        // Heartbeat ID
         this.monitorId = null;
     }
 
@@ -182,38 +279,27 @@ class BasePlayer {
             visualizer.connect(this.analyser);
         }
         if (this.audioCtx.state === 'suspended') this.audioCtx.resume();
-        
-        // START THE WATCHER
         this.startMonitor();
     }
 
-    // --- HEARTBEAT MONITOR ---
-    // This loop checks every 100ms if the audio is dead but shouldn't be.
     startMonitor() {
         if (this.monitorId) clearInterval(this.monitorId);
-        
         this.monitorId = setInterval(() => {
             if (this.isStopped) return;
-            
-            // Sync Visualizer
             if (this.activeSource && this.audioCtx) {
                 const now = this.audioCtx.currentTime;
                 let cur = this.playedOffset + (now - this.startTime);
-                // Clamp display
                 if (this.fullAudioBuffer && cur > this.fullAudioBuffer.duration) cur = this.fullAudioBuffer.duration;
-                
                 this.visualizer.currentTime = cur;
-                const dispTotal = this.isDownloading ? this.estimatedDuration : (this.fullAudioBuffer ? this.fullAudioBuffer.duration : 0);
-                this.visualizer.updateTime(cur, dispTotal);
+                // If downloading, use estimated total; else use real buffer duration
+                const total = this.isDownloading && this.estimatedDuration ? this.estimatedDuration : (this.fullAudioBuffer ? this.fullAudioBuffer.duration : 0);
+                this.visualizer.updateTime(cur, total);
             }
-
-            // AUTO-RESUME CHECK
-            // If we have a buffer, but NO active source, and we aren't at the end...
+            // Auto-Revive
             if (this.fullAudioBuffer && !this.activeSource) {
-                // Are we at the end of the *full* file?
-                const tolerance = 0.2; // 200ms
-                if (this.playedOffset < this.fullAudioBuffer.duration - tolerance) {
-                    console.log("Heartbeat: Audio died unexpectedly. Reviving...");
+                const tol = 0.2;
+                if (this.playedOffset < this.fullAudioBuffer.duration - tol) {
+                    // console.log("Reviving...");
                     this.playSourceFrom(this.playedOffset);
                 }
             }
@@ -224,43 +310,29 @@ class BasePlayer {
         this.isStopped = true;
         this.isDownloading = false;
         if (this.monitorId) clearInterval(this.monitorId);
-        
         if (this.abortController) { this.abortController.abort(); this.abortController = null; }
-        if (this.activeSource) {
-            this.activeSource.onended = null;
-            try { this.activeSource.stop(); } catch(e){}
-            this.activeSource = null;
-        }
+        if (this.activeSource) { this.activeSource.onended = null; try { this.activeSource.stop(); } catch(e){} this.activeSource = null; }
         if (this.audioCtx) { this.audioCtx.close().catch(()=>{}); this.audioCtx = null; }
         this.fullAudioBuffer = null;
         this.playedOffset = 0;
-        this.estimatedDuration = 0;
     }
 
     playSourceFrom(time) {
         if (this.isStopped || !this.fullAudioBuffer || !this.audioCtx) return;
-
-        if (this.activeSource) {
-            this.activeSource.onended = null;
-            try { this.activeSource.stop(); } catch(e){}
-        }
+        if (this.activeSource) { this.activeSource.onended = null; try { this.activeSource.stop(); } catch(e){} }
 
         const source = this.audioCtx.createBufferSource();
         source.buffer = this.fullAudioBuffer;
         source.connect(this.analyser);
         this.activeSource = source;
-        
         this.startTime = this.audioCtx.currentTime;
         this.playedOffset = time;
-
         source.start(0, time);
-
         source.onended = () => {
             if (this.isStopped) return;
             const playedDuration = this.audioCtx.currentTime - this.startTime;
             this.playedOffset = this.playedOffset + playedDuration;
             this.activeSource = null;
-            // The Heartbeat monitor will pick this up and restart if needed.
         };
     }
 
@@ -272,17 +344,16 @@ class BasePlayer {
 }
 
 /**
- * 🌊 STREAM PLAYER
+ * 🌊 AIFF MANUAL PLAYER
  */
-class StreamPlayer extends BasePlayer {
-    constructor(type) {
+class AiffManualPlayer extends BasePlayer {
+    constructor() {
         super();
-        this.type = type;
-        if (type === "WAV" || type === "AIFF") {
-            this.INITIAL_THRESHOLD = 1024 * 1024; 
-        } else {
-            this.INITIAL_THRESHOLD = 256 * 1024; 
-        }
+        this.parser = new AiffParser();
+        this.pcmPlanes = []; // Array of Float32Arrays for each channel
+        this.totalSamplesProcessed = 0;
+        this.estimatedDuration = 0;
+        this.totalFileBytes = 0;
     }
 
     async play(url, onProgress) {
@@ -296,71 +367,137 @@ class StreamPlayer extends BasePlayer {
             this.totalFileBytes = +response.headers.get('Content-Length');
             const reader = response.body.getReader();
             
-            let chunks = []; 
-            let totalBytes = 0; 
-            let lastProcessedBytes = 0;
-            let isFirstProcessing = true;
+            // Accumulate all bytes in a growing array for this manual parser approach
+            // Note: For huge files (100MB+), this is memory heavy. But reliable for AIFF.
+            let receivedChunks = [];
+            let totalReceivedLength = 0;
+            let lastDecodeOffset = 0; // Where we stopped processing audio data
 
             while (true) {
                 const { done, value } = await reader.read();
                 if (this.isStopped) return;
-                
                 if (done) {
                     this.isDownloading = false;
-                    if (totalBytes > lastProcessedBytes) {
-                        await this.process(chunks, totalBytes, true);
-                    }
+                    await this.process(receivedChunks, totalReceivedLength, true);
                     break;
                 }
 
-                chunks.push(value);
-                totalBytes += value.length;
-                
-                onProgress((totalBytes/this.totalFileBytes)*100, (totalBytes/1024/1024).toFixed(2) + " MB", `Buffering ${this.type}...`);
+                receivedChunks.push(value);
+                totalReceivedLength += value.length;
 
-                const newBytes = totalBytes - lastProcessedBytes;
-                const threshold = isFirstProcessing ? this.INITIAL_THRESHOLD : BUFFER_THRESHOLD;
+                onProgress((totalReceivedLength/this.totalFileBytes)*100, (totalReceivedLength/1024/1024).toFixed(2) + " MB", "Parsing AIFF...");
 
-                if (newBytes >= threshold) {
-                    await this.process(chunks, totalBytes, false);
-                    lastProcessedBytes = totalBytes;
-                    isFirstProcessing = false;
+                // Every 1MB, try to parse
+                if (totalReceivedLength - lastDecodeOffset >= BUFFER_THRESHOLD) {
+                    // We just pass everything. The parser will handle the state.
+                    // (Optimization: In production, we would slice only new data, but header parsing requires context)
+                    // For Simplicity & Reliability: We rebuild from the accumulated chunks.
+                    await this.process(receivedChunks, totalReceivedLength, false);
+                    lastDecodeOffset = totalReceivedLength;
                 }
             }
             onProgress(100, "Done", "Playing");
-
-        } catch (e) { 
-            if (e.name !== "AbortError") console.error(e); 
-        }
+        } catch (e) { if (e.name !== "AbortError") console.error(e); }
     }
 
     async process(chunks, size, isFinal) {
         if (this.isStopped) return;
 
+        // Flatten chunks for parsing
         const flat = new Uint8Array(size);
-        let off = 0; 
-        for (let c of chunks) { flat.set(c, off); off += c.length; }
+        let off = 0; for (let c of chunks) { flat.set(c, off); off += c.length; }
+        const view = new DataView(flat.buffer);
 
-        if (this.type === "AIFF" && !isFinal) AiffHeaderPatcher.patch(new DataView(flat.buffer), size);
+        // 1. Parse Header
+        if (!this.parser.headerParsed) {
+            const success = this.parser.parseHeader(view);
+            if (!success) return; // Wait for more data
+        }
+
+        // 2. Decode Available Audio Data
+        // Calculate where audio data ends
+        const dataEnd = Math.min(flat.byteLength, this.parser.dataOffset + this.parser.dataSize);
+        // Only decode if we have data past the offset
+        if (flat.byteLength > this.parser.dataOffset) {
+            // Get the raw audio part
+            const audioRaw = new Uint8Array(flat.buffer, this.parser.dataOffset, dataEnd - this.parser.dataOffset);
+            
+            // Convert to Float32
+            const pcmData = this.parser.decode(audioRaw);
+            
+            // Create AudioBuffer
+            const length = pcmData[0].length;
+            if (length > 0) {
+                const buffer = this.audioCtx.createBuffer(this.parser.numChannels, length, this.parser.sampleRate);
+                for (let ch = 0; ch < this.parser.numChannels; ch++) {
+                    buffer.copyToChannel(pcmData[ch], ch);
+                }
+                this.fullAudioBuffer = buffer;
+                
+                // Update Estimate
+                this.estimatedDuration = (this.totalFileBytes / (this.parser.bitDepth/8 * this.parser.numChannels)) / this.parser.sampleRate;
+            }
+        }
+    }
+}
+
+/**
+ * 🌊 GENERIC PLAYER (MP3/WAV/FLAC)
+ * Uses the previous robust logic (StreamPlayer)
+ */
+class GenericPlayer extends BasePlayer {
+    constructor(type) {
+        super();
+        this.type = type;
+        this.INITIAL_THRESHOLD = (type === "WAV") ? 1024 * 1024 : 256 * 1024;
+    }
+
+    async play(url, onProgress) {
+        this.isStopped = false;
+        this.isDownloading = true;
+        this.init(visualizer);
+        this.abortController = new AbortController();
+
+        try {
+            const response = await fetch(url, { signal: this.abortController.signal });
+            this.totalFileBytes = +response.headers.get('Content-Length');
+            const reader = response.body.getReader();
+            let chunks = []; let totalBytes = 0; let lastProcessedBytes = 0; let isFirst = true;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (this.isStopped) return;
+                if (done) {
+                    this.isDownloading = false;
+                    if (totalBytes > lastProcessedBytes) await this.process(chunks, totalBytes, true);
+                    break;
+                }
+                chunks.push(value); totalBytes += value.length;
+                onProgress((totalBytes/this.totalFileBytes)*100, (totalBytes/1024/1024).toFixed(2) + " MB", `Buffering ${this.type}...`);
+                const threshold = isFirst ? this.INITIAL_THRESHOLD : BUFFER_THRESHOLD;
+                if (totalBytes - lastProcessedBytes >= threshold) {
+                    await this.process(chunks, totalBytes, false);
+                    lastProcessedBytes = totalBytes;
+                    isFirst = false;
+                }
+            }
+            onProgress(100, "Done", "Playing");
+        } catch (e) { if (e.name !== "AbortError") console.error(e); }
+    }
+
+    async process(chunks, size, isFinal) {
+        if (this.isStopped) return;
+        const flat = new Uint8Array(size);
+        let off = 0; for (let c of chunks) { flat.set(c, off); off += c.length; }
+        
+        // Use Header Patching only for WAV now (AIFF has its own player)
         if (this.type === "WAV" && !isFinal) WavHeaderPatcher.patch(new DataView(flat.buffer), size);
 
         try {
             const decoded = await this.audioCtx.decodeAudioData(flat.buffer.slice(0));
             this.fullAudioBuffer = decoded;
-
-            // Update Estimate
-            if (this.totalFileBytes > 0 && size > 0) {
-                this.estimatedDuration = decoded.duration * (this.totalFileBytes / size);
-            } else {
-                this.estimatedDuration = decoded.duration;
-            }
-
-            // Note: We don't force play here anymore. 
-            // The Heartbeat monitor will see !activeSource and start it for us immediately.
-            
-        } catch (e) {
-            console.warn("Decode failed, waiting...", e);
-        }
+            if (this.totalFileBytes > 0 && size > 0) this.estimatedDuration = decoded.duration * (this.totalFileBytes / size);
+        } catch (e) {}
     }
 }
 
@@ -369,11 +506,12 @@ class StreamPlayer extends BasePlayer {
  */
 class PlayerFactory {
     static getPlayer(type) {
-        return new StreamPlayer(type);
+        if (type === "AIFF") return new AiffManualPlayer();
+        return new GenericPlayer(type);
     }
 }
 
-// DATA (Redacted)
+// [DATA & UI SETUP REMAINS THE SAME]
 const PLAYLIST = [
     { type: "AIFF", url: "https://pdkkheetcdvnrsikdses.supabase.co/storage/v1/object/sign/user-files/ea12cfd6-0a51-42f4-9ad6-ba33fff1846f/sample4.aiff?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV84MTRmNzI0Yi1lYzI2LTQ4ZmUtYjk4ZS04Mjk1ZmYxYzBmMGMiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJ1c2VyLWZpbGVzL2VhMTJjZmQ2LTBhNTEtNDJmNC05YWQ2LWJhMzNmZmYxODQ2Zi9zYW1wbGU0LmFpZmYiLCJpYXQiOjE3NjQ0MjY4OTUsImV4cCI6MTc2NDUxMzI5NX0.umFufQ8e-jgCtLXJbA4qDpVDeBZd6zNGU4OBXKsZ8J0" },
     { type: "FLAC", url: "https://pdkkheetcdvnrsikdses.supabase.co/storage/v1/object/sign/user-files/ea12cfd6-0a51-42f4-9ad6-ba33fff1846f/sample3.flac?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV84MTRmNzI0Yi1lYzI2LTQ4ZmUtYjk4ZS04Mjk1ZmYxYzBmMGMiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJ1c2VyLWZpbGVzL2VhMTJjZmQ2LTBhNTEtNDJmNC05YWQ2LWJhMzNmZmYxODQ2Zi9zYW1wbGUzLmZsYWMiLCJpYXQiOjE3NjQ0MjcwOTUsImV4cCI6MTc2NDUxMzQ5NX0.c6qaIX5TpLJIGQJ3HfLIH7e3brnC39lEUVpjYPbXqME" },
